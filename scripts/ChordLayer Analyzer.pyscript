@@ -1,0 +1,109 @@
+# -*- coding: utf-8 -*-
+"""ChordLayer Analyzer - report the chords and key in this piano roll.
+
+A diagnostic companion to ChordLayer: it shows what the detector sees, so you
+can check how a progression is interpreted before generating a melody.
+
+Install alongside the main ChordLayer script (same folder) and run it from
+the piano roll scripts menu.
+"""
+
+import os
+import sys
+
+# Make the bundled ChordLayer package importable inside FL Studio and in tests.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (
+    _HERE,
+    os.path.dirname(_HERE),
+    os.path.join(_HERE, "ChordLayer"),
+):
+    if os.path.isdir(_candidate) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+try:
+    import flpianoroll as flp  # type: ignore
+except ImportError:  # headless import (unit tests)
+    flp = None  # type: ignore[assignment]
+
+from chordlayer.chord_detect import SimpleNote, detect_chords
+from chordlayer.theory import NOTE_NAMES
+
+
+def analyze_notes(notes, ticks_per_beat, tsnum=4, tsden=4):
+    """Pure core shared with the unit tests. Returns (lines, tonic, scale)."""
+    if ticks_per_beat <= 0:
+        raise ValueError("Invalid PPQ")
+    ticks_per_beat = float(ticks_per_beat)
+    if tsden != 4:
+        ticks_per_beat = ticks_per_beat * (4.0 / tsden)
+
+    simple = [
+        SimpleNote(
+            pitch=int(note.number),
+            start=int(note.time),
+            length=max(1, int(note.length)),
+            muted=bool(getattr(note, "muted", False)),
+        )
+        for note in notes
+    ]
+    candidates = [note for note in simple if not note.muted]
+    result = detect_chords(candidates, ticks_per_beat, min_length_beats=0.25)
+
+    lines = []
+    if not result.chords:
+        lines.append("No chords detected.")
+        lines.append("Write at least a two-note dyad, or select some notes and re-run.")
+        return lines, 0, "Major (Ionian)"
+
+    key_name = NOTE_NAMES[result.tonic % 12]
+    lines.append(
+        "Key: {} {} (auto)   Notes: {}   Chord slices: {}   Skipped slices: {}".format(
+            key_name,
+            result.scale_name.split(" ")[0],
+            len(simple),
+            len(result.chords),
+            result.skipped_slices,
+        )
+    )
+    bar_length = ticks_per_beat * tsnum * (4.0 / tsden)
+    for chord in result.chords:
+        bar = int(chord.start * ticks_per_beat // bar_length) + 1
+        beat = chord.start % tsnum
+        lines.append(
+            "bar {} beat {:>4.1f}  {:<7} ({:.2f} beats)".format(
+                bar, beat + 1.0, chord.label, chord.length
+            )
+        )
+    return lines, result.tonic, result.scale_name
+
+
+def createDialog():
+    """No knobs: the Analyzer just reports what it finds."""
+    return flp.ScriptDialog(
+        "ChordLayer Analyzer",
+        "Shows the chords and key detected in this piano roll. "
+        "Press OK to see the report.",
+    )
+
+
+def apply(form):
+    if flp is None:
+        return
+    try:
+        ppq = flp.score.PPQ
+        tsnum = flp.score.tsnum or 4
+        tsden = flp.score.tsden or 4
+        notes = [flp.score.getNote(i) for i in range(flp.score.noteCount)]
+        lines, tonic, scale_name = analyze_notes(notes, ppq, tsnum, tsden)
+        report = "\n".join(lines)
+        flp.Utils.ShowMessage(report)
+        try:
+            flp.Utils.log("ChordLayer Analyzer:\n" + report)
+        except AttributeError:
+            pass
+    except Exception as error:  # never crash the dialog
+        try:
+            flp.Utils.log("ChordLayer Analyzer failed: {!r}".format(error))
+        except AttributeError:
+            pass

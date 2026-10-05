@@ -1,0 +1,323 @@
+# -*- coding: utf-8 -*-
+"""ChordLayer - layer a melody over the chords in your piano roll.
+
+Reads the chords already in the piano roll (or uses an optional typed
+progression such as "Am F C G"), then generates a melody layer on top.
+Generated notes are tagged with one note color (default: color 16) and
+selected, so you can find, tweak, or Ctrl+X them to another instrument.
+
+Install: copy this file plus the ChordLayer package folder into
+    Documents/Image-Line/FL Studio/Settings/Piano roll scripts/
+then open a piano roll and pick  Piano roll > Tools > Riff machine / Scripts
+> ChordLayer  (location depends on FL version).
+
+The dialog is re-applied live while you tweak controls. Every run first
+removes notes that carry the melody color (so nothing else in the roll is
+ever touched), then regenerates from scratch. Same Seed = same melody.
+"""
+
+import os
+import sys
+
+# Make the bundled ChordLayer package importable inside FL Studio and in tests.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (
+    _HERE,
+    os.path.dirname(_HERE),
+    os.path.join(_HERE, "ChordLayer"),
+):
+    if os.path.isdir(_candidate) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+try:
+    import flpianoroll as flp  # type: ignore
+except ImportError:  # headless import (unit tests); apply() guards on this
+    flp = None  # type: ignore[assignment]
+
+# tools/build_standalone.py replaces the empty dict below with the full engine
+# source, producing a single-file script that needs no package folder.
+_INLINE_ENGINE = {}
+
+
+def _install_inline_engine():
+    """Materialise the inlined engine as importable chordlayer modules."""
+    import types
+
+    package = types.ModuleType("chordlayer")
+    package.__file__ = "<chordlayer-inline>"
+    package.__package__ = "chordlayer"
+    package.__path__ = []
+    sys.modules["chordlayer"] = package
+    for path, source in _INLINE_ENGINE.items():
+        stem = os.path.basename(path)
+        module = package if stem == "__init__.py" else types.ModuleType(
+            "chordlayer." + stem[:-3]
+        )
+        module.__file__ = "<chordlayer-inline/" + path + ">"
+        module.__package__ = "chordlayer"
+        sys.modules[module.__name__] = module
+        exec(compile(source, module.__file__, "exec"), module.__dict__)
+        if module is not package:
+            setattr(package, stem[:-3], module)
+
+
+if _INLINE_ENGINE:
+    _install_inline_engine()
+
+import chordlayer.generator as generator
+import chordlayer.theory as theory
+
+# Tuple order == dialog combo order. Keep in sync with the README.
+SOURCES = ("Whole roll", "Selection only")
+KEY_CHOICES = ("Auto (from chords)",) + theory.NOTE_NAMES
+SCALE_CHOICES = (
+    "Auto (from chords)",
+    "Major (Ionian)",
+    "Natural Minor (Aeolian)",
+    "Harmonic Minor",
+    "Dorian",
+    "Phrygian",
+    "Lydian",
+    "Mixolydian",
+    "Locrian",
+    "Major Pentatonic",
+    "Minor Pentatonic",
+    "Chromatic",
+)
+
+_WARNED = False
+
+
+class MelodyProblem(Exception):
+    """A user-facing condition that prevents generation (shown once per run)."""
+
+
+# ---------------------------------------------------------------------------
+# Pure core (no FL objects) - exercised directly by the unit tests.
+# ---------------------------------------------------------------------------
+
+
+def run_chordlayer(
+    notes,
+    ticks_per_beat,
+    beats_per_bar=4.0,
+    source="Whole roll",
+    progression_text="",
+    key_index=0,
+    scale_index=0,
+    rhythm_index=0,
+    density=0.8,
+    rest_chance=0.1,
+    gate=0.9,
+    strategy_index=0,
+    contour_index=0,
+    center_octave=4,
+    range_semitones=12,
+    motif_bars=0,
+    velocity=0.8,
+    velocity_jitter=0.05,
+    timing_jitter=0.0,
+    melody_color=15,
+    seed=1,
+):
+    """Full pipeline: notes -> chords -> melody notes.
+
+    ``notes`` is any sequence of objects with ``number``/``time``/``length``
+    and optional ``selected``/``muted`` attributes (FL Note objects work).
+    Returns a list of ``generator.MelodyNote``.
+    """
+    from chordlayer.chord_detect import SimpleNote, detect_chords
+
+    if ticks_per_beat <= 0:
+        raise MelodyProblem("Invalid project timing (PPQ).")
+
+    simple = [
+        SimpleNote(
+            pitch=int(note.number),
+            start=int(note.time),
+            length=max(1, int(note.length)),
+            selected=bool(getattr(note, "selected", False)),
+            muted=bool(getattr(note, "muted", False)),
+        )
+        for note in notes
+    ]
+    if progression_text:
+        # Typed progression: the roll does not need chord notes at all.
+        candidates = simple
+    else:
+        candidates = [note for note in simple if not note.muted]
+        if source == "Selection only":
+            selected = [note for note in candidates if note.selected]
+            if not selected:
+                raise MelodyProblem(
+                    "Source is 'Selection only' but no notes are selected."
+                )
+            candidates = selected
+
+    result = detect_chords(
+        candidates,
+        ticks_per_beat,
+        min_length_beats=0.25,
+        progression_text=progression_text,
+    )
+    if not result.chords:
+        raise MelodyProblem(
+            "No chords found - write some chords first, or type a progression "
+            "(e.g. 'Am F C G')."
+        )
+
+    if key_index > 0:
+        tonic = key_index - 1
+    else:
+        tonic = result.tonic
+    if scale_index > 0:
+        scale_name = SCALE_CHOICES[scale_index]
+    else:
+        scale_name = result.scale_name
+
+    params = generator.MelodyParams(
+        ticks_per_beat=ticks_per_beat,
+        chords=result.chords,
+        tonic=tonic,
+        scale_name=scale_name,
+        rhythm_preset=generator.RHYTHM_PRESETS[rhythm_index],
+        density=density,
+        rest_chance=rest_chance,
+        gate=gate,
+        strategy=generator.STRATEGIES[strategy_index],
+        contour=generator.CONTOURS[contour_index],
+        center_octave=center_octave,
+        range_semitones=range_semitones,
+        motif_bars=motif_bars,
+        velocity=velocity,
+        velocity_jitter=velocity_jitter,
+        timing_jitter=timing_jitter,
+        seed=seed,
+        melody_color=melody_color,
+        beats_per_bar=beats_per_bar,
+    )
+    problems = params.validate()
+    if problems:
+        raise MelodyProblem(problems[0])
+    return generator.generate_melody(params)
+
+
+# ---------------------------------------------------------------------------
+# FL Studio glue
+# ---------------------------------------------------------------------------
+
+
+def createDialog():
+    """Build the auto-generated dialog (called by FL Studio)."""
+    form = flp.ScriptDialog(
+        "ChordLayer",
+        "Layers a generated melody over the chords in this piano roll. "
+        "Melody notes share one note color so you can select/cut them fast.",
+    )
+    form.addInputCombo("Source", list(SOURCES), 0)
+    form.addInputText("Progression (optional)", "")
+    form.addInputCombo("Key", list(KEY_CHOICES), 0)
+    form.addInputCombo("Scale", list(SCALE_CHOICES), 0)
+    form.addInputCombo("Rhythm", list(generator.RHYTHM_PRESETS), 0)
+    form.addInputKnob("Density", 0.8, 0.0, 1.0)
+    form.addInputKnob("Rest chance", 0.1, 0.0, 0.9)
+    form.addInputKnob("Gate", 0.9, 0.1, 1.0)
+    form.addInputCombo("Pitch strategy", list(generator.STRATEGIES), 0)
+    form.addInputCombo("Contour", list(generator.CONTOURS), 0)
+    form.addInputKnobInt("Center octave", 4, 0, 9)
+    form.addInputKnobInt("Range (semitones)", 12, 1, 24)
+    form.addInputKnobInt("Motif bars", 0, 0, 8)
+    form.addInputKnob("Velocity", 0.8, 0.1, 1.0)
+    form.addInputKnob("Velocity jitter", 0.05, 0.0, 0.5)
+    form.addInputKnobInt("Timing jitter (ticks)", 0, 0, 60)
+    form.addInputKnobInt("Melody color", 15, 0, 15)
+    form.addInputCheckbox("Clear previous melody", True)
+    form.addInputKnobInt("Seed", 1, 1, 9999)
+    global _WARNED
+    _WARNED = False
+    return form
+
+
+def apply(form):
+    """Called by FL Studio on OK and on every live control change."""
+    if flp is None:  # headless (tests import this module directly)
+        return
+    global _WARNED
+    try:
+        _apply_impl(form)
+    except MelodyProblem as problem:
+        _log(f"ChordLayer: {problem}")
+        if not _WARNED:
+            _WARNED = True
+            flp.Utils.ShowMessage(f"ChordLayer: {problem}")
+    except Exception as error:  # keep the dialog alive, report in the log
+        _log(f"ChordLayer failed: {error!r}")
+
+
+def _apply_impl(form):
+    ppq = flp.score.PPQ
+    tsden = flp.score.tsden or 4
+    tsnum = flp.score.tsnum or 4
+    ticks_per_beat = ppq * 4.0 / tsden
+    beats_per_bar = tsnum * (4.0 / tsden)
+
+    notes = [flp.score.getNote(index) for index in range(flp.score.noteCount)]
+    melody_color = int(form.getInputValue("Melody color"))
+
+    if bool(form.getInputValue("Clear previous melody")):
+        _delete_notes_with_color(notes, melody_color)
+        notes = [flp.score.getNote(index) for index in range(flp.score.noteCount)]
+
+    melody = run_chordlayer(
+        notes,
+        ticks_per_beat=ticks_per_beat,
+        beats_per_bar=beats_per_bar,
+        source=SOURCES[int(form.getInputValue("Source"))],
+        progression_text=str(form.getInputValue("Progression (optional)") or "").strip(),
+        key_index=int(form.getInputValue("Key")),
+        scale_index=int(form.getInputValue("Scale")),
+        rhythm_index=int(form.getInputValue("Rhythm")),
+        density=float(form.getInputValue("Density")),
+        rest_chance=float(form.getInputValue("Rest chance")),
+        gate=float(form.getInputValue("Gate")),
+        strategy_index=int(form.getInputValue("Pitch strategy")),
+        contour_index=int(form.getInputValue("Contour")),
+        center_octave=int(form.getInputValue("Center octave")),
+        range_semitones=int(form.getInputValue("Range (semitones)")),
+        motif_bars=int(form.getInputValue("Motif bars")),
+        velocity=float(form.getInputValue("Velocity")),
+        velocity_jitter=float(form.getInputValue("Velocity jitter")),
+        timing_jitter=float(form.getInputValue("Timing jitter (ticks)")),
+        melody_color=melody_color,
+        seed=int(form.getInputValue("Seed")),
+    )
+
+    for spec in melody:
+        note = flp.Note()
+        note.number = int(spec.pitch)
+        note.time = int(spec.start)
+        note.length = int(spec.length)
+        note.velocity = float(spec.velocity)
+        note.color = melody_color
+        note.selected = True
+        flp.score.addNote(note)
+
+    _log(f"ChordLayer: generated {len(melody)} melody notes (color {melody_color + 1}).")
+
+
+def _delete_notes_with_color(notes, melody_color):
+    """Remove every note carrying the melody color (indices descend)."""
+    doomed = [
+        index
+        for index, note in enumerate(notes)
+        if int(note.color) == melody_color
+    ]
+    for index in reversed(doomed):
+        flp.score.deleteNote(index)
+
+
+def _log(message):
+    try:
+        flp.Utils.log(message)
+    except AttributeError:  # older builds: no log hook available
+        pass
